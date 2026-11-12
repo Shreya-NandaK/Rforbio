@@ -1,0 +1,298 @@
+# ============================================================
+# TCGA-LUAD Differential Expression: miRNA + mRNA + lncRNA
+# Complete pipeline with all fixes applied
+# ============================================================
+
+# ============================================================
+# BLOCK 1 — Install and load packages (no redundant reinstall)
+# ============================================================
+required_pkgs <- c("TCGAbiolinks", "DESeq2", "SummarizedExperiment",
+                   "biomaRt", "org.Hs.eg.db", "EnsDb.Hsapiens.v86",
+                   "AnnotationDbi", "httr")
+
+missing_pkgs <- required_pkgs[!required_pkgs %in% rownames(installed.packages())]
+
+if (length(missing_pkgs) > 0) {
+  if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+  BiocManager::install(missing_pkgs, ask = FALSE)
+} else {
+  message("All required packages already installed. Skipping installation.")
+}
+
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+# ============================================================
+# BLOCK 2 — Network and timeout configuration
+# ============================================================
+options(timeout = 600)
+
+httr::set_config(
+  httr::config(
+    connecttimeout = 120,
+    timeout        = 600
+  )
+)
+
+# ============================================================
+# BLOCK 3 — Global helpers
+# ============================================================
+
+# --- Condition vector from TCGA barcodes ---
+make_condition <- function(col_names) {
+  factor(
+    ifelse(as.numeric(substr(col_names, 14, 15)) < 10, "Tumor", "Normal"),
+    levels = c("Normal", "Tumor")
+  )
+}
+
+# --- Retry wrapper for GDCdownload ---
+robust_GDCdownload <- function(query, max_retries = 5, wait_seconds = 30, ...) {
+  attempt <- 1
+  while (attempt <= max_retries) {
+    tryCatch({
+      message("Download attempt ", attempt, " of ", max_retries, "...")
+      GDCdownload(query, ...)
+      message("Download successful.")
+      return(invisible(NULL))
+    }, error = function(e) {
+      msg <- conditionMessage(e)
+      if (grepl("Connection reset|curl|recv|peer|timeout", msg, ignore.case = TRUE)) {
+        message("Connection error on attempt ", attempt, ": ", msg)
+        if (attempt < max_retries) {
+          message("Retrying in ", wait_seconds, " seconds...")
+          Sys.sleep(wait_seconds)
+        } else {
+          stop("All ", max_retries, " download attempts failed. ",
+               "Check your network or try again later.\nLast error: ", msg)
+        }
+      } else {
+        stop(e)
+      }
+    })
+    attempt <- attempt + 1
+  }
+}
+
+# --- DESeq2 runner ---
+run_deseq2 <- function(count_matrix, lfc_thresh = 2, padj_thresh = 1e-5) {
+  sample_info <- data.frame(
+    row.names = colnames(count_matrix),
+    condition = make_condition(colnames(count_matrix))
+  )
+  
+  n_normal <- sum(sample_info$condition == "Normal")
+  if (n_normal < 2) {
+    warning("Fewer than 2 Normal samples detected — DESeq2 dispersion estimates may be unreliable.")
+  }
+  
+  dds <- DESeqDataSetFromMatrix(
+    countData = round(count_matrix),
+    colData   = sample_info,
+    design    = ~ condition
+  )
+  dds <- dds[rowSums(counts(dds)) > 10, ]
+  dds <- DESeq(dds)
+  
+  res <- results(dds, contrast = c("condition", "Tumor", "Normal"))
+  
+  de <- subset(res, abs(log2FoldChange) > lfc_thresh & padj < padj_thresh)
+  
+  data.frame(
+    feature    = rownames(de),
+    logFC      = de$log2FoldChange,
+    baseMean   = de$baseMean,
+    lfcSE      = de$lfcSE,
+    stat       = de$stat,
+    pvalue     = de$pvalue,
+    FDR        = de$padj,
+    regulation = ifelse(de$log2FoldChange > 0, "Up", "Down"),
+    stringsAsFactors = FALSE
+  )
+}
+
+# --- Offline annotation helper (no biomaRt/network required) ---
+offline_annotate <- function(ensembl_ids) {
+  
+  # Strip version suffix e.g. ENSG00000141510.12 -> ENSG00000141510
+  clean_ids <- sub("\\..*$", "", ensembl_ids)
+  
+  # Symbol mapping via org.Hs.eg.db
+  sym_map <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys    = clean_ids,
+    columns = c("ENSEMBL", "SYMBOL"),
+    keytype = "ENSEMBL"
+  )
+  sym_map <- sym_map[!duplicated(sym_map$ENSEMBL), ]
+  sym_map <- sym_map[!is.na(sym_map$ENSEMBL), ]
+  
+  # Biotype mapping via EnsDb.Hsapiens.v86
+  bio_map <- AnnotationDbi::select(
+    EnsDb.Hsapiens.v86,
+    keys    = clean_ids,
+    columns = c("GENEID", "GENEBIOTYPE"),
+    keytype = "GENEID"
+  )
+  bio_map <- bio_map[!duplicated(bio_map$GENEID), ]
+  
+  # Merge symbol and biotype maps
+  anno <- merge(
+    sym_map, bio_map,
+    by.x  = "ENSEMBL", by.y = "GENEID",
+    all.x = TRUE
+  )
+  colnames(anno) <- c("ensembl_gene_id", "hgnc_symbol", "gene_biotype")
+  
+  # Preserve original versioned IDs for joining back to results
+  id_df <- data.frame(
+    ensembl_gene_id_orig = ensembl_ids,
+    ensembl_gene_id      = clean_ids,
+    stringsAsFactors     = FALSE
+  )
+  anno <- merge(id_df, anno, by = "ensembl_gene_id", all.x = TRUE)
+  anno$ensembl_gene_id <- anno$ensembl_gene_id_orig
+  anno$ensembl_gene_id_orig <- NULL
+  
+  return(anno)
+}
+
+# ============================================================
+# BLOCK 4 — miRNA analysis
+# ============================================================
+message("\n--- Querying TCGA-LUAD miRNA ---")
+query_mirna <- GDCquery(
+  project       = "TCGA-LUAD",
+  data.category = "Transcriptome Profiling",
+  data.type     = "miRNA Expression Quantification",
+  workflow.type = "BCGSC miRNA Profiling"
+)
+
+robust_GDCdownload(query_mirna, method = "client", files.per.chunk = 10)
+raw_mirna <- GDCprepare(query_mirna)
+
+# GDCprepare returns a data.frame for miRNA, not a SummarizedExperiment
+if (is.data.frame(raw_mirna)) {
+  mirna_ids <- raw_mirna[, 1]
+  cnt_cols  <- grep("read_count", colnames(raw_mirna))
+  mirna_mat <- as.matrix(raw_mirna[, cnt_cols])
+  rownames(mirna_mat) <- mirna_ids
+  # Strip read_count_ prefix to recover TCGA barcodes
+  colnames(mirna_mat) <- sub("read_count_", "", colnames(mirna_mat))
+} else {
+  mirna_mat <- assay(raw_mirna)
+}
+mirna_mat <- mirna_mat[, !duplicated(colnames(mirna_mat))]
+
+de_mirna <- run_deseq2(mirna_mat)
+
+write.csv(de_mirna, "TCGA_LUAD_DE_miRNA.csv", row.names = FALSE)
+message("miRNA: ", nrow(de_mirna), " DE features written to TCGA_LUAD_DE_miRNA.csv")
+
+# ============================================================
+# BLOCK 5 — mRNA + lncRNA shared download
+# ============================================================
+message("\n--- Querying TCGA-LUAD mRNA / lncRNA ---")
+query_mrna <- GDCquery(
+  project               = "TCGA-LUAD",
+  data.category         = "Transcriptome Profiling",
+  data.type             = "Gene Expression Quantification",
+  workflow.type         = "STAR - Counts",
+  experimental.strategy = "RNA-Seq"
+)
+
+robust_GDCdownload(query_mrna, method = "client", files.per.chunk = 10)
+se_mrna <- GDCprepare(query_mrna)
+
+# ============================================================
+# BLOCK 6 — mRNA analysis
+# ============================================================
+message("\n--- Running mRNA differential expression ---")
+
+mrna_mat <- assay(se_mrna, "unstranded")
+mrna_mat <- mrna_mat[, !duplicated(colnames(mrna_mat))]
+
+# Retain protein-coding genes using rowData biotype annotation
+gene_info <- as.data.frame(rowData(se_mrna))
+
+# Detect correct biotype column name (varies by TCGAbiolinks version)
+biotype_col <- intersect(c("gene_type", "gene_biotype"), colnames(gene_info))
+if (length(biotype_col) == 0) {
+  stop("No biotype column found in rowData. Available columns:\n",
+       paste(colnames(gene_info), collapse = ", "))
+}
+biotype_col <- biotype_col[1]
+message("Using biotype column: ", biotype_col)
+
+coding_ids <- rownames(gene_info)[
+  !is.na(gene_info[[biotype_col]]) & gene_info[[biotype_col]] == "protein_coding"
+]
+mrna_mat <- mrna_mat[rownames(mrna_mat) %in% coding_ids, ]
+message("Protein-coding features retained: ", nrow(mrna_mat))
+
+# Annotate offline
+id_map <- offline_annotate(rownames(mrna_mat))
+id_map <- id_map[!duplicated(id_map$ensembl_gene_id), ]
+
+de_mrna <- run_deseq2(mrna_mat)
+
+de_mrna <- merge(
+  de_mrna,
+  id_map[, c("ensembl_gene_id", "hgnc_symbol")],
+  by.x  = "feature", by.y = "ensembl_gene_id",
+  all.x = TRUE
+)
+de_mrna <- de_mrna[, c("feature", "hgnc_symbol", "logFC", "baseMean",
+                       "lfcSE", "stat", "pvalue", "FDR", "regulation")]
+
+write.csv(de_mrna, "TCGA_LUAD_DE_mRNA.csv", row.names = FALSE)
+message("mRNA: ", nrow(de_mrna), " DE features written to TCGA_LUAD_DE_mRNA.csv")
+
+# ============================================================
+# BLOCK 7 — lncRNA analysis
+# ============================================================
+message("\n--- Running lncRNA differential expression ---")
+
+lncrna_biotypes <- c(
+  "lncRNA", "lincRNA", "antisense",
+  "processed_transcript", "sense_intronic",
+  "sense_overlapping", "bidirectional_promoter_lncRNA",
+  "macro_lncRNA", "non_coding"
+)
+
+# Subset lncRNA IDs from gene_info (reuses biotype_col detected above)
+lnc_ids <- rownames(gene_info)[
+  !is.na(gene_info[[biotype_col]]) & gene_info[[biotype_col]] %in% lncrna_biotypes
+]
+message("lncRNA IDs found in rowData: ", length(lnc_ids))
+
+# Build lnc_mat explicitly (not assumed from environment)
+lnc_mat <- assay(se_mrna, "unstranded")
+lnc_mat <- lnc_mat[rownames(lnc_mat) %in% lnc_ids, ]
+lnc_mat <- lnc_mat[, !duplicated(colnames(lnc_mat))]
+message("lnc_mat dimensions: ", nrow(lnc_mat), " features x ", ncol(lnc_mat), " samples")
+
+# Sanity check
+if (nrow(lnc_mat) == 0) {
+  stop("lnc_mat has 0 rows. Check biotype strings against available types:\n",
+       paste(unique(gene_info[[biotype_col]]), collapse = ", "))
+}
+
+# Annotate offline
+lnc_anno <- offline_annotate(rownames(lnc_mat))
+lnc_anno <- lnc_anno[lnc_anno$gene_biotype %in% lncrna_biotypes, ]
+lnc_anno <- lnc_anno[!duplicated(lnc_anno$ensembl_gene_id), ]
+
+de_lnc <- run_deseq2(lnc_mat)
+
+de_lnc <- merge(
+  de_lnc,
+  lnc_anno[, c("ensembl_gene_id", "hgnc_symbol", "gene_biotype")],
+  by.x  = "feature", by.y = "ensembl_gene_id",
+  all.x = TRUE
+)
+de_lnc <- de_lnc[, c("feature", "hgnc_symbol", "gene_biotype",
+                     "logFC", "baseMean", "lfcSE", "stat",
+                     "pvalue", "FDR", "regulation")]
+
+write.csv(de_lnc, "TCGA_LUAD_DE_lncRNA.csv", row.names = FALSE)
+message("lncRNA: ", nrow(de_lnc), " DE features written to TCGA_LUAD_DE_lncRNA.csv")
