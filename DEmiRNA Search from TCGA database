@@ -1,0 +1,186 @@
+#Apart from directly visiting sites to obtain a list of differentially expressed micro-RNAs in Lung Adenocarcinoma, 
+#I used R Programming to obtain the list and a Volcano Plot to compare the up- and down-regulated miRNAs. 
+
+#PS - I provided parameters to ensure statistical significance of the data being listed in the output.
+
+
+
+# Step1 - Loading relevant libraries
+if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("GEOquery", "Biobase", "limma"), update = FALSE, ask = FALSE)
+
+library(GEOquery)
+library(Biobase)
+library(limma)
+library(ggplot2)
+
+# Step2 - List out 
+GSE_ID  = GSE15852 #replace this with 
+out_csv = paste0(GSE_ID, "_significant_miRNA.csv")
+out_png = paste0(GSE_ID, "_Volcano_Plot.png")
+
+# ── 2. Download & Prepare ─────────────────────────────────────
+gse  = getGEO(GSE_ID, GSEMatrix = TRUE)
+eset = gse[[1]]
+expr = exprs(eset)
+
+# ── 3. Log2-transform if on linear scale ─────────────────────
+qx <- as.numeric(quantile(expr, c(0, 0.25, 0.5, 0.75, 1.0), na.rm = TRUE))
+if (qx[5] > 100 || (qx[5] - qx[1] > 50)) {
+  expr[expr <= 0] <- NA
+  expr <- log2(expr)
+}
+exprs(eset) <- expr
+
+# ── 4. Group Assignment ───────────────────────────────────────
+meta      <- pData(eset)
+group_raw <- gsub(".*: ", "", as.character(meta$characteristics_ch1))
+
+# Print all unique values to inspect
+message("Unique raw group values:")
+print(unique(group_raw))
+
+# If characteristics_ch1 is uninformative, scan other columns
+if (length(unique(group_raw)) < 2) {
+  candidate_cols = sapply(meta, function(x) length(unique(na.omit(x))))
+  best_col       = names(which(candidate_cols >= 2 & candidate_cols <= 10))[1]
+  group_raw      = gsub(".*: ", "", as.character(meta[[best_col]]))
+  message("Switched to metadata column: ", best_col)
+  message("Unique values: ", paste(unique(group_raw), collapse = ", "))
+}
+
+group = as.factor(group_raw)
+
+# Keep the two most frequent groups
+top_groups = names(sort(table(group), decreasing = TRUE))[1:2]
+message("Comparing: '", top_groups[1], "'  vs  '", top_groups[2], "'")
+
+keep  = group %in% top_groups
+eset  = eset[, keep]
+group = droplevels(group[keep])
+
+# Relevel: Normal/Control as reference
+ref_idx <- grep("normal|control|healthy", levels(group), ignore.case = TRUE)
+if (length(ref_idx) > 0)
+  group <- relevel(group, ref = levels(group)[ref_idx[1]])
+
+message("Reference: '", levels(group)[1], "'  |  Test: '", levels(group)[2], "'")
+message("Sample counts per group:")
+print(table(group))
+
+# ── CRITICAL: Remove probes with any NA values ────────────────
+expr_mat  <- exprs(eset)
+na_probes <- apply(expr_mat, 1, function(x) any(is.na(x)))
+message("Probes with NAs removed: ", sum(na_probes))
+eset <- eset[!na_probes, ]
+
+# ── CRITICAL: Check degrees of freedom ───────────────────────
+n_samples <- ncol(eset)
+n_groups  <- nlevels(group)
+df_resid  <- n_samples - n_groups
+
+message("Samples: ", n_samples,
+        " | Groups: ", n_groups,
+        " | Residual df: ", df_resid)
+
+if (df_resid < 1) {
+  stop("Not enough samples for linear modelling. ",
+       "Need at least ", n_groups + 1, " samples, have ", n_samples, ".")
+}
+
+# ── CRITICAL: Verify design matrix is full rank ───────────────
+design <- model.matrix(~ group)
+message("Design matrix rank: ", qr(design)$rank,
+        " | Columns: ",  ncol(design))
+
+if (qr(design)$rank < ncol(design)) {
+  stop("Design matrix is not full rank — check for sample/group imbalance.")
+}
+
+# ── 5. Differential Expression (limma) ───────────────────────
+fit <- lmFit(eset, design)
+fit <- eBayes(fit)
+res <- topTable(fit, coef = 2, number = Inf, adjust.method = "fdr")
+
+# ── 6. Annotation ─────────────────────────────────────────────
+anno    <- fData(eset)
+mir_col <- intersect(c("miRNA_ID", "GENE_SYMBOL", "NAME", "ID"), colnames(anno))
+if (length(mir_col) == 0) {
+  message("No standard miRNA annotation column found. Using probe IDs.")
+  res$miRNA = rownames(res)
+} else {
+  mir_col   = mir_col[1]
+  message("Using annotation column: ", mir_col)
+  res$miRNA = anno[rownames(res), mir_col]
+}
+
+# ── 7. Classify DE Status ─────────────────────────────────────
+res$diffexpressed = "Stable"
+res$diffexpressed[res$logFC >  1 & res$P.Value < 0.05] <- "Up"
+res$diffexpressed[res$logFC < -1 & res$P.Value < 0.05] <- "Down"
+
+up_n   = sum(res$diffexpressed == "Up",   na.rm = TRUE)
+down_n = sum(res$diffexpressed == "Down", na.rm = TRUE)
+message("Upregulated: ", up_n, " | Downregulated: ", down_n)
+
+# ── 8. Volcano Plot ───────────────────────────────────────────
+res$label = NA
+sig_idx   = which(res$diffexpressed != "Stable")
+if (length(sig_idx) > 0) {
+  top_idx            <- sig_idx[order(res$P.Value[sig_idx])[1:min(10, length(sig_idx))]]
+  res$label[top_idx] <- res$miRNA[top_idx]
+}
+
+volcano <- ggplot(res, aes(x = logFC, y = -log10(P.Value), color = diffexpressed)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  scale_color_manual(
+    values = c("Up" = "#E63946", "Down" = "#1D71B8", "Stable" = "grey70"),
+    name   = "Expression"
+  ) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", linewidth = 0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", linewidth = 0.5) +
+  {
+    if (requireNamespace("ggrepel", quietly = TRUE))
+      ggrepel::geom_text_repel(aes(label = label), size = 2.8,
+                               max.overlaps = 20, na.rm = TRUE, color = "black")
+  } +
+  annotate("text",
+           x = max(res$logFC, na.rm = TRUE) * 0.85,
+           y = max(-log10(res$P.Value), na.rm = TRUE) * 0.97,
+           label = paste0("Up: ", up_n), color = "#E63946", size = 3.5) +
+  annotate("text",
+           x = min(res$logFC, na.rm = TRUE) * 0.85,
+           y = max(-log10(res$P.Value), na.rm = TRUE) * 0.97,
+           label = paste0("Down: ", down_n), color = "#1D71B8", size = 3.5) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle   = element_text(hjust = 0.5, color = "grey40"),
+    legend.position = "right"
+  ) +
+  labs(
+    title    = paste("Volcano Plot:", GSE_ID),
+    subtitle = paste(levels(group)[2], "vs", levels(group)[1]),
+    x        = "Log2 Fold Change",
+    y        = expression(-log[10](P~value))
+  )
+
+print(volcano)
+ggsave(out_png, volcano, width = 8, height = 6, dpi = 300)
+message("Volcano plot saved → ", out_png)
+
+# ── 9. Export Significant miRNAs ──────────────────────────────
+DE_miRNA = res[abs(res$logFC) > 1 & res$P.Value < 0.05, ]
+DE_miRNA = DE_miRNA[!is.na(DE_miRNA$miRNA) & DE_miRNA$miRNA != "", ]
+
+final_df = data.frame(
+  miRNA_ID  = DE_miRNA$miRNA,
+  Direction = DE_miRNA$diffexpressed,
+  Log2FC    = DE_miRNA$logFC,
+  PValue    = DE_miRNA$P.Value,
+  FDR       = DE_miRNA$adj.P.Val,
+  stringsAsFactors = FALSE
+)
+final_df = final_df[order(final_df$PValue), ]
+
+write.csv(final_df, out_csv, row.names = FALSE)
