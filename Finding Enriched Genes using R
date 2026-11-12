@@ -1,0 +1,191 @@
+# =============================================================================
+# Pre-Ranked GSEA: TCGA LUAD DEGs vs FOXO1 ChIP-Atlas Targets (FIXED VERSION)
+# =============================================================================
+
+# --- 1. Install / Load Required Packages -------------------------------------
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+pkgs_bioc <- c("fgsea", "clusterProfiler")
+pkgs_cran <- c("readxl", "tidyverse", "writexl", "ggplot2", "ggrepel")
+
+for (pkg in pkgs_bioc) {
+  if (!requireNamespace(pkg, quietly = TRUE)) BiocManager::install(pkg)
+}
+for (pkg in pkgs_cran) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+
+library(fgsea)
+library(clusterProfiler)
+library(readxl)
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+
+# --- 2. File Selection -------------------------------------------------------
+
+message("Select FOXO1 ChIP-Atlas Excel file")
+chip_path <- file.choose()
+
+message("Select pre-ranked DEG (.rnk) file")
+rnk_path <- file.choose()
+
+message("Select full DEG list (.csv)")
+deg_path <- file.choose()
+
+output_dir <- dirname(deg_path)
+
+# --- 3. Read Files -----------------------------------------------------------
+
+chip_raw <- read_excel(chip_path, sheet = "FOXO1.1", col_names = TRUE)
+rnk_df   <- read_tsv(rnk_path, col_names = TRUE, show_col_types = FALSE)
+deg_df   <- read_csv(deg_path, show_col_types = FALSE)
+
+colnames(rnk_df)[1:2] <- c("gene_symbol", "score")
+
+# --- 4. FIX 1: Filter ChIP-Atlas Genes (CRITICAL STEP) ------------------------
+
+# Extract FOXO1 average binding row
+avg_row <- chip_raw[chip_raw$Target_genes == "FOXO1|Average", ]
+
+# Convert scores to numeric
+scores <- as.numeric(avg_row[1, -1])
+names(scores) <- colnames(avg_row)[-1]
+
+# Remove NA
+scores <- scores[!is.na(scores)]
+
+# OPTION A: Threshold-based filtering
+threshold <- 100   # you can tune this (50–200 typical)
+foxo1_genes <- names(scores[scores > threshold])
+
+# OPTION B (alternative): Top N genes (uncomment if preferred)
+# top_n <- 500
+# foxo1_genes <- names(sort(scores, decreasing = TRUE))[1:top_n]
+
+cat("Filtered FOXO1 genes:", length(foxo1_genes), "\n")
+
+# --- 5. Build Ranked Vector --------------------------------------------------
+
+rnk_clean <- rnk_df %>%
+  filter(!is.na(gene_symbol), !is.na(score)) %>%
+  arrange(desc(abs(score))) %>%
+  distinct(gene_symbol, .keep_all = TRUE)
+
+# OPTIONAL FIX: Improve ranking metric if needed
+# Uncomment if your score is not already meaningful
+# rnk_clean <- rnk_clean %>%
+#   mutate(score = sign(log2FoldChange) * -log10(pvalue))
+
+ranked_vector <- setNames(rnk_clean$score, rnk_clean$gene_symbol)
+ranked_vector <- sort(ranked_vector, decreasing = TRUE)
+
+cat("Total ranked genes:", length(ranked_vector), "\n")
+
+# --- 6. Overlap Check (IMPORTANT QC) -----------------------------------------
+
+overlap_genes <- intersect(foxo1_genes, names(ranked_vector))
+
+cat("FOXO1 genes:", length(foxo1_genes), "\n")
+cat("Overlap:", length(overlap_genes), "\n")
+
+if (length(overlap_genes) < 10) {
+  warning("Low overlap! Check gene ID format.")
+}
+
+# --- 7. Run fgsea ------------------------------------------------------------
+
+set.seed(42)
+
+gene_sets <- list(FOXO1_Targets = foxo1_genes)
+
+fgsea_res <- fgsea(
+  pathways = gene_sets,
+  stats    = ranked_vector,
+  minSize  = 10,
+  maxSize  = 1000,
+  nperm    = 10000
+)
+
+print(fgsea_res)
+
+# --- 8. Run clusterProfiler GSEA ---------------------------------------------
+
+term2gene <- data.frame(
+  term = "FOXO1_Targets",
+  gene = foxo1_genes
+)
+
+cp_gsea <- GSEA(
+  geneList      = ranked_vector,
+  TERM2GENE     = term2gene,
+  pvalueCutoff  = 1,
+  minGSSize     = 10,
+  maxGSSize     = 1000,
+  verbose       = FALSE,
+  seed          = 42
+)
+
+if (nrow(cp_gsea@result) > 0) {
+  print(cp_gsea@result[, c("ID","NES","pvalue","p.adjust")])
+}
+
+# --- 9. Extract Enriched Genes (KEY OUTPUT) ----------------------------------
+
+leading_edge_fgsea <- if (nrow(fgsea_res) > 0) fgsea_res$leadingEdge[[1]] else character(0)
+
+core_genes_cp <- if (nrow(cp_gsea@result) > 0) {
+  strsplit(cp_gsea@result$core_enrichment[1], "/")[[1]]
+} else character(0)
+
+enriched_genes_all <- unique(c(leading_edge_fgsea, core_genes_cp))
+
+cat("Final enriched genes:", length(enriched_genes_all), "\n")
+
+# --- 10. Annotate ------------------------------------------------------------
+
+enriched_annotated <- deg_df %>%
+  filter(gene_symbol %in% enriched_genes_all) %>%
+  arrange(pvalue)
+
+print(head(enriched_annotated, 20))
+
+# --- 11. Save Outputs --------------------------------------------------------
+
+write_csv(fgsea_res %>%
+            mutate(leadingEdge = sapply(leadingEdge, paste, collapse = ";")),
+          file.path(output_dir, "fgsea_result_filtered.csv"))
+
+write_csv(as.data.frame(cp_gsea@result),
+          file.path(output_dir, "clusterProfiler_result_filtered.csv"))
+
+write_csv(enriched_annotated,
+          file.path(output_dir, "enriched_genes_annotated_filtered.csv"))
+
+write_csv(data.frame(gene = enriched_genes_all),
+          file.path(output_dir, "enriched_gene_list_filtered.csv"))
+
+# --- 12. Plots ---------------------------------------------------------------
+
+# fgsea plot
+if (length(overlap_genes) >= 10) {
+  png(file.path(output_dir, "fgsea_plot_filtered.png"), 800, 600)
+  print(plotEnrichment(gene_sets[[1]], ranked_vector))
+  dev.off()
+}
+
+# volcano plot
+volcano_df <- deg_df %>%
+  mutate(
+    neg_log10_p = -log10(pvalue),
+    highlight   = gene_symbol %in% enriched_genes_all
+  )
+
+p <- ggplot(volcano_df, aes(log2FoldChange, neg_log10_p)) +
+  geom_point(aes(color = highlight), alpha = 0.6) +
+  scale_color_manual(values = c("grey", "red")) +
+  theme_classic()
+
+ggsave(file.path(output_dir, "volcano_filtered.png"), p)
